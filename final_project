@@ -1,0 +1,365 @@
+#define FULL_STEP
+#include "myheader.h"
+
+const char keypad[16] = { '1', '2', '3', 'A',
+	                        '4', '5', '6', 'B',
+	                        '7', '8', '9', 'C',
+	                        '*', '0', '#', 'D' };
+
+unsigned char isPushed[16] = { };
+int stepperPin[4] = { 2, 3, 6, 7 };
+const unsigned int stepperFullState[4][4] = { { 1, 1, 0, 0 },
+                                              { 0, 1, 1, 0 },
+																							{ 0, 0, 1, 1 },
+																							{ 1, 0, 0, 1 } }; // save the method for applying voltage to motor
+int currentStep = 0;
+//Used for motor operation
+void Step(int step);
+//Used for elevator move
+void move_level(int target);
+//Used for door move
+void open_door(void);
+void close_door(void);
+
+//Used for joystick detection
+void EXTI0_IRQHandler(void);
+void EXTI1_IRQHandler(void);
+void EXTI2_IRQHandler(void);
+//Used for ultrasonic detection
+void EXTI3_IRQHandler(void);
+//Used to measure 10us
+void SysTick_Handler(void);
+
+//Initializes Joystick settings
+void Joy_Init(void);
+//Initializes Keypad settings
+void Keypad_Init(void);
+
+void ADC1_Init(void);
+unsigned int GetADCResult(void);
+void Delay_us(uint32_t us);
+
+//Initializes ultrasonic sensor settings
+void UltrasonicInit(void);
+
+//Used to save the state of door
+int open = 0;
+//Used to save current elevator level
+int current_level = 1;
+//Used to save the state of elevator move
+int is_move = 0;
+// check time when door is open
+unsigned int open_start_time = 0;
+unsigned int prev_time;
+// Store the current time
+unsigned int time = 0;
+// check if the door hadn't been opened before or not
+unsigned int first_open_door_flag = 1;
+//Used to save the state of the trig pin in ultrasonic sensor
+int trig_state = 0;
+//Used to save the state of the recv pin in ultrasonic sensor
+int recv_state = 0;
+//Used to make a delay for ultrasonic sensor trig pulses
+unsigned int delay_time = 0;
+int sonic_value = 0;
+
+
+
+int main(void)
+{
+	ClockInit();
+	USART2_Init();
+	Joy_Init();
+	Keypad_Init();
+	ADC1_Init();
+	UltrasonicInit();
+	
+	GPIO_Init(GPIOH, 0, GPIO_OUTPUT);
+	
+	while (1)
+	{
+		if(open == 1) // if door is open
+		{
+			if(first_open_door_flag == 1) // if the door hadn't been opened before
+			{
+        open_start_time = time;
+				first_open_door_flag = 0;
+      }
+      if(time - open_start_time >= 500000) // 5s has passed since the door opened
+      {
+         close_door();
+         first_open_door_flag = 1;
+      }
+		}
+
+		else{ // we can get keypad input when door is closed
+			for (int i = 0; i < 3; i++)
+			{
+				GPIOE->BSRR |= (1 << ((i - 1 + 3) % 3 + 10 + 16)); // output '0' to previous GPIO
+				Delay_us(1000);
+				GPIO_Init(GPIOE, (i - 1 + 3) % 3 + 10, GPIO_ANALOG); // switch previous pin to default mode.
+				
+				GPIO_Init(GPIOE, i + 10, GPIO_OUTPUT); // set current pin to output
+				GPIOE->BSRR |= (1 << (i + 10)); // output '1' to current pin.
+				Delay_us(1000);
+				
+				for (int j = 13; j < 16; j++)
+				{
+					if (GPIOE->IDR & (1 << j)) // key input is detected
+					{
+						if (!isPushed[4 * i + (j-13)]) // check array to block consecutive input
+						{
+							isPushed[4 * i + (j-13)] = 1; // set '1' value to array to block consecutive input
+							move_level(keypad[4 * i  + (j - 13)] - '0'); // move elevator to target level
+						}
+					}
+					
+					else isPushed[4 * i + (j-13)] = 0; // clear matching values in an array
+				}
+			}
+		}
+		
+    unsigned int flex_output=GetADCResult();   //get flex sensor adc result
+		if(flex_output>200){   //overcapacity
+       open_start_time = time;   //reset open time
+       GPIOH->BSRR = 0x00000001;   //LED ON
+    }
+    else{
+       GPIOH->BSRR = 0x00010000;   //LED OFF
+    }
+	}
+}
+
+void Step(int step)
+{
+	int direction = (step > 0) ? 1 : -1; // motor rotate direction define
+	while (step != 0)
+	{
+		#ifdef FULL_STEP
+		currentStep = (currentStep + direction + 4) % 4; // using full step rotate
+		#elif defined HALF_STEP
+		currentStep = (currentStep + direction + 8) % 8;
+		#endif
+		
+		for (int i = 0; i < 4; i++)
+		{
+			#ifdef FULL_STEP
+			GPIOB->BSRR = (stepperFullState[currentStep][i] << stepperPin[i]);
+			GPIOB->BSRR = (!stepperFullState[currentStep][i] << (stepperPin[i] + 16)); // operating stepping motor with full_step
+			#elif defined HALF_STEP
+			GPIOB->BSRR = (stepperHalfState[currentStep][i] << stepperPin[i]);
+			GPIOB->BSRR = (!stepperHalfState[currentStep][i] << (stepperPin[i] + 16));
+			#endif
+		}
+		
+		step -= direction; // operate motor till step become zero
+		Delay_us(2000);
+	}
+}
+
+void move_level(int target)
+{
+	while(1){
+		if (target == current_level){ // elevator is on the target level
+			is_move = 0; // clear move bit
+			open_door(); // open door
+			break;
+		}
+		else{ // elevator move to the target level
+			is_move = 1; // set move bit to block door move
+			int left = target - current_level; // get gap between current level and target level
+			if (left < 0){ // if target level is lower that current level
+				left = -left;
+				while(left > 0){
+					Step(-1000); // elevator move downward
+					current_level -= 1; // reset current level
+					left -= 1;
+				}
+				Delay_us(1000000);
+			}
+			else{
+				while(left > 0){
+					Step(1000); // elevator move upward
+					current_level += 1; // reset currne level
+					left -= 1;
+				}
+				Delay_us(1000000);
+			}
+		}
+	}
+}
+
+void open_door(void)
+{
+	if(is_move == 0){// if elevator is not moving
+		if(first_open_door_flag == 1){ // If the door was supposed to open but it wasn't open,
+			Step(500); // open the door
+		}
+		first_open_door_flag = 1; // set door opened bit
+		open = 1; // set open bit
+	}
+}
+
+void close_door(void)
+{
+	Step(-500); // close the door
+	open = 0; // clear open bit
+}
+
+void EXTI0_IRQHandler(void) // joystick pushed ->Press the Call button on the first floor
+{
+	move_level(1); // move to 1st floor
+	EXTI->PR1 |= EXTI_PR1_PIF0;
+}
+
+void EXTI1_IRQHandler(void) // joystick left -> press open button from the in side
+{
+	open_start_time = time; // The door is still open
+	EXTI->PR1 |= EXTI_PR1_PIF1;
+}
+
+void EXTI2_IRQHandler(void) // joystick right -> press close button from the inside
+{
+	if (open == 1){ // operate when door is opened
+		open = 0; // clear open bit
+		close_door(); // close the door
+	}
+	EXTI->PR1 |= EXTI_PR1_PIF2;
+}
+
+void Joy_Init(void)
+{
+	GPIO_Init(GPIOA, 0, GPIO_INPUT_PULLDOWN);
+	GPIO_Init(GPIOA, 1, GPIO_INPUT_PULLDOWN);
+	GPIO_Init(GPIOA, 2, GPIO_INPUT_PULLDOWN); // set PA0~2 to input with pulldown
+
+	NVIC->ISER[EXTI0_IRQn / 32] = (1 << (EXTI0_IRQn % 32)) | (1 << (EXTI1_IRQn % 32)) | (1 << (EXTI2_IRQn % 32)); // enable exti 0~2
+	EXTI->IMR1 |= (EXTI_IMR1_IM0 | EXTI_IMR1_IM1 | EXTI_IMR1_IM2);
+	EXTI->RTSR1 |= (EXTI_RTSR1_RT0 | EXTI_RTSR1_RT1 | EXTI_RTSR1_RT2);
+}
+
+void Keypad_Init(void)
+{
+	for (int i = 13; i <= 15; i++) // set PE13~15 to input with pulldown
+		GPIO_Init(GPIOE, i, GPIO_INPUT_PULLDOWN);
+   
+	Delay_us(1000);
+   
+	for (int k = 0; k < 4; k++) // set PB0~3 to output
+		GPIO_Init(GPIOB, stepperPin[k], GPIO_OUTPUT);
+}
+void SysTick_Handler(void)
+{
+   //if 50ms passed then reset trig_state to send a 10us signal 
+   if(time - delay_time > 5000)   {
+      trig_state = 0;
+     delay_time = time;
+   }
+   //if trig_state is reseted change GPIOC14 output to 1
+   if(trig_state == 0)
+   {
+      GPIOC->BSRR = GPIO_BSRR_BS14;
+      trig_state = 1;
+   }
+   //after 10us change GPIOC14 output to 0 making a 10us pulse signal that is sent to the trig pin
+   else if(trig_state == 1)
+   {
+      GPIOA->BSRR = GPIO_BSRR_BR14;
+     //change trig_state to 2 to stop the ultrasonic sensor from sending a pulse right away
+      trig_state = 2;
+   }
+   //increment time every 10us
+   time++;
+}
+
+
+unsigned int GetADCResult(void) {
+   unsigned int ADC_Value;
+
+   ADC1->CR |= ADC_CR_ADSTART;   //: Write 1 to start regular conversions. Read 1 means that the ADC is operating and eventually converting a regular channel.
+   while (ADC1->CR & ADC_CR_ADSTART);   //0: No ADC regular conversion is ongoing.
+   ADC_Value = ADC1->DR;   //They contain the conversion result from the last converted regular channel.
+
+   return ADC_Value;
+}
+
+
+void ADC1_Init(void)
+{
+   RCC->AHB2ENR |= RCC_AHB2ENR_ADCEN;   //ADC Clock Enabled
+   
+   GPIO_Init(GPIOA, 5, GPIO_ANALOG);
+   GPIOA->ASCR |= GPIO_ASCR_ASC5;
+   
+   ADC1->SMPR2 = (5 << ADC_SMPR2_SMP10_Pos);   //92.5 ADC clock cycles
+   ADC1->SQR1 = (10 << ADC_SQR1_SQ1_Pos);   //1st conversion = channel 10
+   ADC123_COMMON->CCR = ADC_CCR_PRESC_3 | ADC_CCR_PRESC_0   //input ADC clock divided by 64
+                     | ADC_CCR_CKMODE_1 | ADC_CCR_CKMODE_0;   //HCLK/4 (Synchronous clock mode)
+   
+   ADC1->CR = ADC_CR_ADVREGEN;   //ADC Voltage regulator enabled.
+   Delay_us(1000);
+   ADC1->CR |= ADC_CR_ADCAL;   //Write 1 to calibrate the ADC. Read at 1 means that a calibration in progress.
+   while (ADC1->CR & ADC_CR_ADCAL);   //0: Calibration complete
+   ADC1->CR |= ADC_CR_ADEN;   //Write 1 to enable the ADC.
+   while (!(ADC1->ISR & ADC_ISR_ADRDY));   //ADC is ready to start conversion
+}
+
+void Delay_us(uint32_t us){  
+			if(us>1){
+							 uint32_t count=us*8-6;
+							 while(count--); 
+			 }else{
+							 uint32_t count=2;
+							 while(count--); 
+				}
+}
+
+void UltrasonicInit(void)
+{
+   //set the GPIO pins for the trig and recv from the ultrasonic sensor.
+   //GPIOA3 is getting the signal from the recv pin
+   GPIO_Init(GPIOA, 3, GPIO_INPUT_PULLDOWN);
+   //GPIOC14 is sending the signal for the trig pin
+   GPIO_Init(GPIOC, 14, GPIO_OUTPUT);
+    
+   //enable interrupt for external interrupt 3
+   NVIC->ISER[EXTI0_IRQn / 32] = (1 << (EXTI3_IRQn % 32));
+   EXTI->IMR1 |= EXTI_IMR1_IM3;
+   //enable interrupt detection of rising edge
+   EXTI->RTSR1 |= EXTI_RTSR1_RT3;
+   //enable interrupt detection of falling edge
+   EXTI->FTSR1 |= EXTI_FTSR1_FT3;
+}
+
+
+void EXTI3_IRQHandler(void)
+{
+   //if a rising edge is detected prev_time is set to time to save the exact time of the trigger
+   if(recv_state == 0)
+   {
+      prev_time = time;
+     //change state to 0 to detect falling edge
+      recv_state = 1;
+   }
+   //if a falling edge is detected prev_time is compared to current time to determine the distance between triggers
+   else if(recv_state == 1)
+   {
+      sonic_value = time - prev_time;
+     //if the difference between the times are less than 1ms
+      if(sonic_value < 100)
+      {
+       //LED turns on
+         GPIOH->BSRR = 0x00000001;
+       //resets opening time, keeping the door open longer
+         open_start_time = time;
+      }
+     //if the difference between the times are more than 1ms
+      else{
+       //turn off led
+         GPIOH->BSRR = 0x00010000;
+      }
+     //change state to 0 to detect rising edge
+      recv_state = 0;
+   }
+   EXTI->PR1 |= EXTI_PR1_PIF3;
+}
